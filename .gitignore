@@ -1,0 +1,10 @@
+*~
+*.o
+*.o.*
+*.ko
+*.ko.cmd
+*.mod.c
+.metrum-fpga.*
+.tmp_versions/
+modules.order
+Module.symvers
