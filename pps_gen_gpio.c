@@ -201,7 +201,7 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 		goto err_dt;
 	}
 
-	devdata->pps_gpio = devm_gpiod_get(dev, "pps-gen", GPIOD_OUT_LOW);
+	devdata->pps_gpio = devm_gpiod_get(dev, "pps-gen");
 	if (IS_ERR(devdata->pps_gpio)) {
 		ret = PTR_ERR(devdata->pps_gpio);
 		dev_err(dev, "Cannot get PPS GPIO [%d]\n", ret);
