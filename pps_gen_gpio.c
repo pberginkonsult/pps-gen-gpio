@@ -56,16 +56,33 @@ static long hrtimer_avg_latency = SAFETY_INTERVAL_NS;
 /* hrtimer event callback */
 static enum hrtimer_restart hrtimer_callback(struct hrtimer *timer)
 {
+	int gpio_value_to_set;
 	unsigned long irq_flags;
 	long hrtimer_latency;
 	struct pps_gen_gpio_devdata *devdata =
 		container_of(timer, struct pps_gen_gpio_devdata, timer);
+	const long NSEC_PER_HALF_SEC = (NSEC_PER_SEC / 2);
 	const long time_gpio_deassert_ns =
 		NSEC_PER_SEC - devdata->gpio_instr_time;
 	const long time_gpio_assert_ns =
-		time_gpio_deassert_ns - gpio_pulse_width_ns;
+		NSEC_PER_HALF_SEC - devdata->gpio_instr_time;
 	struct timespec ts_expire_req, ts_expire_real, ts_gpio_instr_time,
-			ts_hrtimer_latency, ts1, ts2;
+		ts_hrtimer_latency, ts1, ts2;
+	long time_gpio_change_ns;
+	long next_expire_time_s;
+	long next_expire_time_ns;
+	int loop_counter = 0;
+
+	/* Figure out if we are in the middle of the second based on requested expiration time */
+	ts_expire_req = ktime_to_timespec(hrtimer_get_softexpires(timer));
+	if (ts_expire_req.tv_nsec < NSEC_PER_HALF_SEC) {
+		time_gpio_change_ns = time_gpio_assert_ns;
+		gpio_value_to_set = 1;
+	}
+	else {
+		time_gpio_change_ns = time_gpio_deassert_ns;
+		gpio_value_to_set = 0;
+	}
 
 	/* We have to disable interrupts here. The idea is to prevent
 	 * other interrupts on the same processor to introduce random
@@ -78,34 +95,29 @@ static enum hrtimer_restart hrtimer_callback(struct hrtimer *timer)
 	 */
 	local_irq_save(irq_flags);
 
-	/* Get current timestamp and requested time to check if we are late. */
+	/* Get current timestamp and check if we are late. */
 	getnstimeofday(&ts_expire_real);
-	ts_expire_req = ktime_to_timespec(hrtimer_get_softexpires(timer));
-	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec
-	    || ts_expire_real.tv_nsec > time_gpio_assert_ns) {
-		local_irq_restore(irq_flags);
-		pr_err("We are late this time [%ld.%09ld]\n",
-		       ts_expire_real.tv_sec, ts_expire_real.tv_nsec);
-		goto done;
+
+	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec ||
+	    ts_expire_real.tv_nsec > time_gpio_change_ns) {
+		pr_err("pps-gen: We are late this time [%ld.%09ld] expected %09ld\n",
+		       ts_expire_real.tv_sec, ts_expire_real.tv_nsec, time_gpio_change_ns);
+
+		// We are late go directly and change gpio pin
+		getnstimeofday(&ts1);
+		goto handle_gpio;
 	}
 
-	/* Busy loop until the time is right for a GPIO assert. */
-	do
+	/* Busy loop until the time is right for a GPIO toggle. */
+	do {
 		getnstimeofday(&ts1);
-	while (ts_expire_req.tv_sec == ts1.tv_sec
-	       && ts1.tv_nsec < time_gpio_assert_ns);
+		loop_counter++;
+	} while (ts_expire_req.tv_sec == ts1.tv_sec
+		 && ts1.tv_nsec < time_gpio_change_ns);
 
+handle_gpio:
 	/* Assert PPS GPIO. */
-	gpiod_set_value(devdata->pps_gpio, PPS_GPIO_HIGH);
-
-	/* Busy loop until the time is right for a GPIO deassert. */
-	do
-		getnstimeofday(&ts1);
-	while (ts_expire_req.tv_sec == ts1.tv_sec
-	       && ts1.tv_nsec < time_gpio_deassert_ns);
-
-	/* Deassert PPS GPIO. */
-	gpiod_set_value(devdata->pps_gpio, PPS_GPIO_LOW);
+	gpiod_set_value(devdata->pps_gpio, gpio_value_to_set);
 
 	getnstimeofday(&ts2);
 	local_irq_restore(irq_flags);
@@ -115,7 +127,6 @@ static enum hrtimer_restart hrtimer_callback(struct hrtimer *timer)
 	devdata->gpio_instr_time = (devdata->gpio_instr_time
 				    + timespec_to_ns(&ts_gpio_instr_time)) / 2;
 
-done:
 	/* Update the average hrtimer latency. */
 	ts_hrtimer_latency = timespec_sub(ts_expire_real, ts_expire_req);
 	hrtimer_latency = timespec_to_ns(&ts_hrtimer_latency);
@@ -131,12 +142,36 @@ done:
 		hrtimer_avg_latency =
 			(3 * hrtimer_avg_latency + hrtimer_latency) / 4;
 
-	/* Update the hrtimer expire time. */
+	/* Check if requested time and real time has got out of sync */
+	/* Should normally don't happen but seen during early boot phase */
+	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec) {
+		if (ts_expire_real.tv_sec - ts_expire_req.tv_sec > 1) {
+			pr_err("Seconds out of sync - will reset req %ld.%09ld real %ld.%09ld\n",
+			       ts_expire_req.tv_sec, ts_expire_req.tv_nsec,
+			       ts_expire_real.tv_sec, ts_expire_real.tv_nsec);
+			ts_expire_req.tv_sec = ts_expire_real.tv_sec;
+		}
+	}
+
+	if (gpio_value_to_set) {
+		next_expire_time_s  = ts_expire_req.tv_sec;
+		next_expire_time_ns = time_gpio_deassert_ns - hrtimer_avg_latency - SAFETY_INTERVAL_NS;
+	}
+	else {
+		next_expire_time_s  = ts_expire_req.tv_sec + 1;
+		next_expire_time_ns = time_gpio_assert_ns - hrtimer_avg_latency - SAFETY_INTERVAL_NS;
+	}
 	hrtimer_set_expires(timer,
-			    ktime_set(ts_expire_req.tv_sec + 1,
-				      time_gpio_assert_ns
-				      - hrtimer_avg_latency
-				      - SAFETY_INTERVAL_NS));
+			    ktime_set(next_expire_time_s,
+				      next_expire_time_ns));
+
+	trace_printk("loop %05d req %ld.%09ld expired %ld.%09ld instr_time %09ld "
+		     "hrtimer_latency %09ld next %ld.%09ld %d\n", loop_counter,
+		     ts_expire_req.tv_sec, ts_expire_req.tv_nsec,
+		     ts_expire_real.tv_sec, ts_expire_real.tv_nsec,
+		     ts_gpio_instr_time.tv_nsec, hrtimer_latency,
+		     ts_expire_req.tv_sec + 1, next_expire_time_ns,
+		     gpio_value_to_set);
 
 	return HRTIMER_RESTART;
 }
@@ -174,6 +209,11 @@ static ktime_t pps_gen_first_timer_event(struct pps_gen_gpio_devdata *devdata)
 	/* First timer callback will be triggered between 1 and 2 seconds from
 	 * now, synchronized to the tv_sec increment of the wall-clock time.
 	 */
+
+	pr_info("setting first timer with expire time %ld.%09ld\n",
+		ts.tv_sec + 1,NSEC_PER_SEC - gpio_pulse_width_ns
+		- devdata->gpio_instr_time - 3 * SAFETY_INTERVAL_NS);
+
 	return ktime_set(ts.tv_sec + 1,
 			 NSEC_PER_SEC - gpio_pulse_width_ns
 			 - devdata->gpio_instr_time - 3 * SAFETY_INTERVAL_NS);
@@ -195,7 +235,7 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 	}
 
 	/* There should be a single PPS generator GPIO pin defined in DT. */
-	if (of_gpio_named_count(dev->of_node, "pps-gen-gpio") != 1) {
+	if (of_gpio_named_count(dev->of_node, "pps-gen-gpios") != 1) {
 		dev_err(dev, "There should be exactly one pps-gen GPIO defined in DT\n");
 		ret = -EINVAL;
 		goto err_dt;
